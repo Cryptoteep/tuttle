@@ -4,7 +4,7 @@ from typing import List, Optional, Dict
 import datetime
 from decimal import Decimal
 
-from .model import InvoiceItem, Invoice, Contract, User, Project
+from .model import InvoiceItem, Invoice, Contract, PaymentMilestone, User, Project
 from .timetracking import Timesheet
 
 
@@ -77,6 +77,99 @@ def generate_fixed_price_invoice(
         description=contract.title,
     )
     invoice.items.append(item)
+    return invoice
+
+
+def _safe_vat_rate(contract: Contract) -> Decimal:
+    """Normalize contract VAT rate to a [0, 1] fraction."""
+    vat_rate = Decimal(str(contract.VAT_rate))
+    while vat_rate > Decimal("1"):
+        vat_rate = vat_rate / Decimal("100")
+    return vat_rate
+
+
+def generate_deposit_invoice(
+    contract: Contract,
+    project: Project,
+    milestone: PaymentMilestone,
+    number: str,
+    date: datetime.date = datetime.date.today(),
+) -> Invoice:
+    """Create a deposit invoice (Abschlagsrechnung) for a payment milestone."""
+    if contract.fixed_price is None:
+        raise ValueError("Deposit invoices require a fixed-price contract.")
+
+    total_price = Decimal(str(contract.fixed_price))
+    if milestone.amount is not None:
+        deposit_amount = Decimal(str(milestone.amount))
+    elif milestone.percentage is not None:
+        deposit_amount = (
+            total_price * Decimal(str(milestone.percentage)) / Decimal("100")
+        )
+    else:
+        raise ValueError("Milestone must have either a percentage or an amount.")
+
+    vat_rate = _safe_vat_rate(contract)
+    invoice = Invoice(
+        date=date,
+        document_type="deposit",
+        contract=contract,
+        contract_id=contract.id,
+        project=project,
+        project_id=project.id,
+        number=number,
+        milestone_id=milestone.id,
+    )
+    item = InvoiceItem(
+        quantity=1,
+        unit="fixed_price",
+        unit_price=deposit_amount,
+        VAT_rate=vat_rate,
+        description=milestone.title,
+    )
+    invoice.items.append(item)
+    return invoice
+
+
+def generate_final_invoice(
+    contract: Contract,
+    project: Project,
+    deposit_invoices: List[Invoice],
+    number: str,
+    date: datetime.date = datetime.date.today(),
+) -> Invoice:
+    """Create a final invoice (Schlussrechnung) that shows the full contract amount
+    and deducts prior deposits. The deduction lines are captured in the model's
+    ``deposit_deductions`` computed property for PDF rendering.
+    """
+    if contract.fixed_price is None:
+        raise ValueError("Final invoices require a fixed-price contract.")
+
+    vat_rate = _safe_vat_rate(contract)
+    total_price = Decimal(str(contract.fixed_price))
+
+    invoice = Invoice(
+        date=date,
+        document_type="final",
+        contract=contract,
+        contract_id=contract.id,
+        project=project,
+        project_id=project.id,
+        number=number,
+    )
+    item = InvoiceItem(
+        quantity=1,
+        unit="fixed_price",
+        unit_price=total_price,
+        VAT_rate=vat_rate,
+        description=contract.title,
+    )
+    invoice.items.append(item)
+
+    for dep in deposit_invoices:
+        dep.deposit_for_id = invoice.id
+
+    invoice.deposits = deposit_invoices
     return invoice
 
 

@@ -41,7 +41,7 @@ from .data_dir import get_data_dir
 from .dev import deprecated
 from .time import Cycle, TimeUnit
 
-DocumentType = Literal["invoice", "reminder"]
+DocumentType = Literal["invoice", "reminder", "deposit", "final"]
 
 
 class RpcMixin:
@@ -433,8 +433,9 @@ class Contract(RpcMixin, SQLModel, table=True):
         "client": None,
         "projects": ("id", "title"),
         "invoices": ("id",),
+        "payment_milestones": None,
     }
-    __rpc_computed__ = ("unit_abbrev", "is_fixed_price")
+    __rpc_computed__ = ("unit_abbrev", "is_fixed_price", "has_milestones")
 
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str = Field(
@@ -507,10 +508,22 @@ class Contract(RpcMixin, SQLModel, table=True):
         back_populates="contract",
         sa_relationship_kwargs={"lazy": "subquery", "passive_deletes": "all"},
     )
+    payment_milestones: List["PaymentMilestone"] = Relationship(
+        back_populates="contract",
+        sa_relationship_kwargs={
+            "lazy": "subquery",
+            "cascade": "all, delete",
+            "order_by": "PaymentMilestone.position",
+        },
+    )
 
     @property
     def is_fixed_price(self) -> bool:
         return self.fixed_price is not None
+
+    @property
+    def has_milestones(self) -> bool:
+        return bool(self.payment_milestones)
 
     @property
     def unit_abbrev(self) -> str:
@@ -572,6 +585,37 @@ class Contract(RpcMixin, SQLModel, table=True):
     # ``ContractsIntent._validated_save`` (canonical write path) and
     # ``normalize_vat_rate`` is used on every ingress (LLM mapping,
     # manual scripts).
+
+
+class PaymentMilestone(RpcMixin, SQLModel, table=True):
+    """A payment milestone defines one instalment in a contract's payment schedule.
+
+    Used for deposit/final invoice workflows (Abschlagsrechnung / Schlussrechnung).
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    contract_id: int = Field(foreign_key="contract.id", ondelete="CASCADE")
+    title: str = Field(description="e.g. 'Upon commissioning', 'On delivery'")
+    percentage: Optional[Decimal] = Field(
+        default=None,
+        sa_column=sqlalchemy.Column(sqlalchemy.Numeric(5, 2), nullable=True),
+        description="Milestone as a percentage of the contract total (e.g. 50).",
+    )
+    amount: Optional[Decimal] = Field(
+        default=None,
+        sa_column=sqlalchemy.Column(sqlalchemy.Numeric(12, 2), nullable=True),
+        description="Milestone as an absolute amount (alternative to percentage).",
+    )
+    position: int = Field(default=0, description="Ordering position.")
+    invoiced: bool = Field(
+        default=False,
+        description="Whether a deposit invoice has been created for this milestone.",
+    )
+
+    contract: "Contract" = Relationship(
+        back_populates="payment_milestones",
+        sa_relationship_kwargs={"lazy": "subquery"},
+    )
 
 
 class Project(RpcMixin, SQLModel, table=True):
@@ -775,15 +819,25 @@ class Timesheet(SQLModel, table=True):
 
 
 class Invoice(RpcMixin, SQLModel, table=True):
-    """An invoice or payment reminder.
+    """An invoice, payment reminder, deposit invoice, or final invoice.
 
-    Reminders reuse the same table (manual STI) with ``document_type``
-    as the discriminator.  A reminder references its predecessor via
-    ``reminder_for_id``, forming a singly-linked chain back to the
-    original invoice.
+    All document types reuse the same table (manual STI) with
+    ``document_type`` as the discriminator:
+
+    - ``"invoice"``  — regular invoice
+    - ``"reminder"`` — payment reminder (linked via ``reminder_for_id``)
+    - ``"deposit"``  — deposit / advance payment invoice (Abschlagsrechnung)
+    - ``"final"``    — final settlement invoice (Schlussrechnung),
+                       deducts prior deposits (linked via ``deposit_for_id``)
     """
 
-    __rpc_relationships__ = ("contract", "project", "items")
+    __rpc_relationships__ = {
+        "contract": None,
+        "project": None,
+        "items": None,
+        "milestone": ("id", "title"),
+        "deposits": None,
+    }
     __rpc_computed__ = (
         "sum",
         "VAT_total",
@@ -797,9 +851,15 @@ class Invoice(RpcMixin, SQLModel, table=True):
         "total_formatted",
         "pdf_path",
         "is_reminder",
+        "is_deposit",
+        "is_final_invoice",
         "reminder_chain_head_id",
+        "deposit_chain_head_id",
         "has_timesheet",
         "timesheet_pdf_path",
+        "remaining_balance",
+        "remaining_balance_formatted",
+        "deposit_deductions",
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -812,8 +872,8 @@ class Invoice(RpcMixin, SQLModel, table=True):
 
     document_type: str = Field(
         default="invoice",
-        description="'invoice' for a regular invoice, 'reminder' for a payment reminder.",
-        schema_extra={"enum": ["invoice", "reminder"]},
+        description="Discriminator: 'invoice', 'reminder', 'deposit', or 'final'.",
+        schema_extra={"enum": ["invoice", "reminder", "deposit", "final"]},
     )
 
     # -- Reminder-specific fields (NULL for regular invoices) --------------
@@ -835,6 +895,19 @@ class Invoice(RpcMixin, SQLModel, table=True):
     reminder_due_date: Optional[datetime.date] = Field(
         default=None,
         description="New payment deadline set by this reminder.",
+    )
+
+    # -- Deposit/final invoice fields (NULL for regular invoices) ----------
+
+    deposit_for_id: Optional[int] = Field(
+        default=None,
+        foreign_key="invoice.id",
+        description="FK to the final invoice this deposit belongs to.",
+    )
+    milestone_id: Optional[int] = Field(
+        default=None,
+        foreign_key="paymentmilestone.id",
+        description="FK to the PaymentMilestone this deposit invoice covers.",
     )
 
     # -- Relationships -----------------------------------------------------
@@ -881,6 +954,27 @@ class Invoice(RpcMixin, SQLModel, table=True):
         },
     )
 
+    # Self-referencing: deposit chain
+    deposit_for: Optional["Invoice"] = Relationship(
+        back_populates="deposits",
+        sa_relationship_kwargs={
+            "remote_side": "Invoice.id",
+            "foreign_keys": "[Invoice.deposit_for_id]",
+            "lazy": "subquery",
+        },
+    )
+    deposits: List["Invoice"] = Relationship(
+        back_populates="deposit_for",
+        sa_relationship_kwargs={
+            "foreign_keys": "[Invoice.deposit_for_id]",
+            "lazy": "subquery",
+        },
+    )
+
+    milestone: Optional["PaymentMilestone"] = Relationship(
+        sa_relationship_kwargs={"lazy": "subquery"},
+    )
+
     # -- Status flags ------------------------------------------------------
 
     sent: Optional[bool] = Field(default=False)
@@ -913,6 +1007,14 @@ class Invoice(RpcMixin, SQLModel, table=True):
     @property
     def is_reminder(self) -> bool:
         return self.document_type == "reminder"
+
+    @property
+    def is_deposit(self) -> bool:
+        return self.document_type == "deposit"
+
+    @property
+    def is_final_invoice(self) -> bool:
+        return self.document_type == "final"
 
     @property
     def sum(self) -> Decimal:
@@ -985,6 +1087,45 @@ class Invoice(RpcMixin, SQLModel, table=True):
         return node.id
 
     @property
+    def deposit_chain_head_id(self) -> Optional[int]:
+        """For a deposit invoice, return the final invoice id if linked, else None."""
+        if self.is_deposit:
+            return self.deposit_for_id
+        if self.is_final_invoice:
+            return self.id
+        return None
+
+    @property
+    def deposit_deductions(self) -> list:
+        """For a final invoice, return list of deposit deduction dicts for rendering."""
+        if not self.is_final_invoice:
+            return []
+        deductions = []
+        for dep in self.deposits:
+            deductions.append(
+                {
+                    "invoice_number": dep.number,
+                    "gross": dep.total,
+                    "vat": dep.VAT_total,
+                    "net": dep.sum,
+                }
+            )
+        return deductions
+
+    @property
+    def remaining_balance(self) -> Decimal:
+        """For a final invoice: total minus sum of deposit gross amounts."""
+        if not self.is_final_invoice:
+            return self.total
+        deposit_gross = sum(d["gross"] for d in self.deposit_deductions)
+        return Decimal(self.total - deposit_gross)
+
+    @property
+    def remaining_balance_formatted(self) -> str:
+        currency = self.contract.currency if self.contract else "EUR"
+        return fmt_currency(self.remaining_balance, currency)
+
+    @property
     def client(self):
         return self.contract.client
 
@@ -998,6 +1139,10 @@ class Invoice(RpcMixin, SQLModel, table=True):
         base = f"{safe_number}-{client_suffix}"
         if self.is_reminder:
             return f"{base}-M{self.reminder_level}"
+        if self.is_deposit:
+            return f"{base}-deposit"
+        if self.is_final_invoice:
+            return f"{base}-final"
         return base
 
     @property

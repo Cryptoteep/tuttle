@@ -9,14 +9,26 @@ data-shape mismatches between the Python core and the frontend.
 """
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import sqlmodel
 
 import tuttle.app.core.abstractions as abstractions
 import tuttle.app_db as app_db_mod
+from tuttle.app.core.abstractions import get_active_db
 from tuttle.app.core.dispatch import dispatch, _intents
 from tuttle.app.core.rpc_utils import reset_all
+from tuttle.model import (
+    User,
+    Contact,
+    Client,
+    Contract,
+    Project,
+    Invoice,
+    InvoiceItem,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +228,149 @@ class TestSerialization:
         invoice = data[0]
         for prop in ("sum", "total", "status", "due_date"):
             assert prop in invoice, f"Invoice missing computed property '{prop}'"
+
+    def test_all_rpc_computed_props_survive_session_close(self, rpc_env):
+        """Every __rpc_computed__ property must be serialisable after the DB
+        session closes — catches DetachedInstanceError from lazy-loaded
+        relationships accessed inside computed properties."""
+        models_routes = [
+            (User, "users.get_active"),
+            (Contact, "contacts.get_all"),
+            (Client, "clients.get_all"),
+            (Contract, "contracts.get_all"),
+            (Project, "projects.get_all"),
+            (Invoice, "invoicing.get_all"),
+        ]
+        for model_cls, route in models_routes:
+            computed = getattr(model_cls, "__rpc_computed__", ())
+            if not computed:
+                continue
+            result = dispatch(route, {})
+            assert result["ok"], f"{route} failed: {result.get('error')}"
+            items = result["data"]
+            if not isinstance(items, list):
+                items = [items]
+            assert len(items) > 0, f"{route} returned no data"
+            for prop in computed:
+                for item in items:
+                    assert prop in item, (
+                        f"{model_cls.__name__} missing computed prop '{prop}' "
+                        f"after serialisation via {route}"
+                    )
+
+    def test_deposit_and_final_invoice_serialize(self, rpc_env):
+        """A final invoice with linked deposits must serialise without
+        DetachedInstanceError when invoicing.get_all runs."""
+        dispatch("db.ensure", {})
+
+        db_url = f"sqlite:///{get_active_db()}"
+        engine = sqlmodel.create_engine(db_url)
+        with sqlmodel.Session(engine) as sess:
+            contract = sess.exec(sqlmodel.select(Contract)).first()
+            assert contract is not None, "No contracts in demo DB"
+            contract.fixed_price = Decimal("10000")
+            sess.add(contract)
+            sess.commit()
+            contract_id = contract.id
+
+        reset_all()
+
+        contracts_res = dispatch("contracts.get_all", {})
+        assert_ok(contracts_res)
+        contracts = contracts_res["data"] or []
+        target = next((c for c in contracts if c["id"] == contract_id), None)
+        assert target is not None
+        project_ids = [p["id"] for p in target.get("projects", [])]
+        assert project_ids, "Contract has no projects"
+        project_id = project_ids[0]
+
+        reset_all()
+
+        ms_res = dispatch(
+            "contracts.save_milestones",
+            {
+                "contract_id": contract_id,
+                "milestones": [
+                    {"title": "Upfront", "percentage": 50, "position": 0},
+                    {"title": "On delivery", "percentage": 50, "position": 1},
+                ],
+            },
+        )
+        assert ms_res["ok"], f"save_milestones failed: {ms_res.get('error')}"
+
+        reset_all()
+
+        ms_list = dispatch(
+            "contracts.get_milestones",
+            {
+                "contract_id": contract_id,
+            },
+        )
+        assert ms_list["ok"], f"get_milestones failed: {ms_list.get('error')}"
+        milestones = ms_list["data"]
+        assert len(milestones) == 2
+
+        deposit_res = dispatch(
+            "invoicing.create_deposit",
+            {
+                "project_id": project_id,
+                "milestone_id": milestones[0]["id"],
+                "invoice_date": "2026-06-28",
+            },
+        )
+        assert deposit_res["ok"], f"create_deposit failed: {deposit_res.get('error')}"
+
+        reset_all()
+
+        result = dispatch("invoicing.get_all", {})
+        assert result["ok"], (
+            f"invoicing.get_all failed after deposit creation: "
+            f"{result.get('error')}"
+        )
+        data = result["data"]
+        deposit = next((i for i in data if i.get("document_type") == "deposit"), None)
+        assert deposit is not None, "Deposit invoice not in get_all results"
+        assert deposit.get("deposit_deductions") is not None
+        assert deposit.get("remaining_balance") is not None
+        try:
+            json.dumps(deposit)
+        except (TypeError, ValueError) as exc:
+            pytest.fail(f"Deposit invoice not JSON-serializable: {exc}")
+
+        reset_all()
+
+        deposit2_res = dispatch(
+            "invoicing.create_deposit",
+            {
+                "project_id": project_id,
+                "milestone_id": milestones[1]["id"],
+                "invoice_date": "2026-06-28",
+            },
+        )
+        assert deposit2_res["ok"], (
+            f"create_deposit (last milestone / final) failed: "
+            f"{deposit2_res.get('error')}"
+        )
+
+        reset_all()
+
+        result2 = dispatch("invoicing.get_all", {})
+        assert result2["ok"], (
+            f"invoicing.get_all failed after final invoice creation: "
+            f"{result2.get('error')}"
+        )
+        data2 = result2["data"]
+        final = next((i for i in data2 if i.get("document_type") == "final"), None)
+        assert final is not None, (
+            "Final invoice not in get_all results — last milestone should "
+            "auto-create a final invoice"
+        )
+        assert isinstance(final.get("deposit_deductions"), list)
+        assert final.get("remaining_balance") is not None
+        try:
+            json.dumps(final)
+        except (TypeError, ValueError) as exc:
+            pytest.fail(f"Final invoice not JSON-serializable: {exc}")
 
     def test_full_response_is_json_serializable(self, rpc_env):
         for method in [

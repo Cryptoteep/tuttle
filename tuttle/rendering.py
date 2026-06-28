@@ -47,6 +47,18 @@ INVOICE_LABELS = {
         "reminder_fee": "Reminder Fee",
         "original_invoice": "Original Invoice",
         "reminder_closing": "Please settle the outstanding amount by the new due date.",
+        "deposit_invoice": "Deposit Invoice",
+        "final_invoice": "Final Invoice",
+        "total_fee": "Total fee",
+        "less_deposit": "less deposit per invoice no.",
+        "vat_included_therein": "VAT included therein",
+        "remaining_balance": "Remaining balance",
+        "gross": "Gross",
+        "deposit_due": "Deposit due",
+        "in_respect_of": "In respect of",
+        "payment_milestone": "Payment milestone",
+        "contract_total": "Contract total",
+        "deposit_closing": "This is a partial payment (deposit invoice) towards the contract total.",
         "units": {
             "hour": ("hour", "hours"),
             "day": ("day", "days"),
@@ -77,6 +89,18 @@ INVOICE_LABELS = {
         "reminder_fee": "Mahngebühr",
         "original_invoice": "Ursprungsrechnung",
         "reminder_closing": "Bitte begleichen Sie den offenen Betrag bis zum neuen Fälligkeitsdatum.",
+        "deposit_invoice": "Abschlagsrechnung",
+        "final_invoice": "Schlussrechnung",
+        "total_fee": "Gesamthonorar",
+        "less_deposit": "abzgl. Abschlag lt. Rechnung Nr.",
+        "vat_included_therein": "darin enthaltene USt.",
+        "remaining_balance": "Restbetrag",
+        "gross": "Brutto",
+        "deposit_due": "Abschlagsbetrag",
+        "in_respect_of": "Betreffend",
+        "payment_milestone": "Zahlungsmeilenstein",
+        "contract_total": "Vertragsgesamtbetrag",
+        "deposit_closing": "Dies ist eine Teilzahlung (Abschlagsrechnung) auf den Vertragsgesamtbetrag.",
         "units": {
             "hour": ("Stunde", "Stunden"),
             "day": ("Tag", "Tage"),
@@ -107,6 +131,18 @@ INVOICE_LABELS = {
         "reminder_fee": "Cargo por recordatorio",
         "original_invoice": "Factura original",
         "reminder_closing": "Le rogamos abone el importe pendiente antes de la nueva fecha de vencimiento.",
+        "deposit_invoice": "Factura de anticipo",
+        "final_invoice": "Factura final",
+        "total_fee": "Honorario total",
+        "less_deposit": "menos anticipo según factura n.º",
+        "vat_included_therein": "IVA incluido",
+        "remaining_balance": "Saldo pendiente",
+        "gross": "Bruto",
+        "deposit_due": "Anticipo a pagar",
+        "in_respect_of": "Referente a",
+        "payment_milestone": "Hito de pago",
+        "contract_total": "Importe total del contrato",
+        "deposit_closing": "Este documento es un pago parcial (factura de anticipo) sobre el importe total del contrato.",
         "units": {
             "hour": ("hora", "horas"),
             "day": ("día", "días"),
@@ -227,6 +263,30 @@ def render_invoice(
         tpl = labels.get("reminder_n", "{n}. Payment Reminder")
         reminder_title = tpl.format(n=n)
 
+    is_deposit = getattr(invoice, "is_deposit", False)
+    is_final = getattr(invoice, "is_final_invoice", False)
+    deposit_deductions = getattr(invoice, "deposit_deductions", []) if is_final else []
+    remaining_balance = (
+        getattr(invoice, "remaining_balance", invoice.total)
+        if is_final
+        else invoice.total
+    )
+
+    contract_title = ""
+    contract_total = None
+    milestone_title = ""
+    milestone_percentage = None
+    if invoice.contract:
+        contract_title = invoice.contract.title or ""
+        contract_total = invoice.contract.fixed_price
+    try:
+        milestone = invoice.milestone
+        if milestone is not None:
+            milestone_title = milestone.title or ""
+            milestone_percentage = milestone.percentage
+    except Exception:
+        pass
+
     invoice_template = template_env.get_template("invoice.html")
     html = invoice_template.render(
         user=user,
@@ -234,6 +294,14 @@ def render_invoice(
         l=labels,
         is_reminder=is_reminder,
         reminder_title=reminder_title,
+        is_deposit=is_deposit,
+        is_final=is_final,
+        deposit_deductions=deposit_deductions,
+        remaining_balance=remaining_balance,
+        contract_title=contract_title,
+        contract_total=contract_total,
+        milestone_title=milestone_title,
+        milestone_percentage=milestone_percentage,
         notes=invoice.notes,
         include_logo=include_logo,
         accent_color=accent_color or "",

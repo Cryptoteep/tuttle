@@ -28,6 +28,7 @@ from tuttle.model import (
     FinancialGoal,
     Invoice,
     InvoiceItem,
+    PaymentMilestone,
     Timesheet,
     TimeTrackingItem,
     Project,
@@ -506,27 +507,42 @@ def create_heating_data(
     # -- contracts (one per client) --------------------------------------------
 
     contracts = []
+    sam_lowry_contract = None
     for i, client in enumerate(clients):
         if client is sam_lowry:
-            rate = 0
-            title = "Heating Repair"
+            contract = Contract(
+                title=f"Heating Repair – {client.name}",
+                client=client,
+                signature_date=fake.date_between(start_date="-30M", end_date="-24M"),
+                start_date=fake.date_between(start_date="-24M", end_date="-20M"),
+                rate=None,
+                fixed_price=Decimal("5000"),
+                currency="EUR",
+                VAT_rate=Decimal("0.19"),
+                unit=TimeUnit.hour,
+                units_per_workday=8,
+                volume=40,
+                term_of_payment=14,
+                billing_cycle=Cycle.monthly,
+            )
+            sam_lowry_contract = contract
         else:
             rate = random.choice([65, 72, 80, 85, 95])
             title = _HEATING_CONTRACTS[i % len(_HEATING_CONTRACTS)]
-        contract = Contract(
-            title=f"{title} – {client.name}",
-            client=client,
-            signature_date=fake.date_between(start_date="-30M", end_date="-24M"),
-            start_date=fake.date_between(start_date="-24M", end_date="-20M"),
-            rate=rate,
-            currency="EUR",
-            VAT_rate=Decimal("0.19"),
-            unit=TimeUnit.hour,
-            units_per_workday=8,
-            volume=random.randint(100, 400),
-            term_of_payment=14,
-            billing_cycle=Cycle.monthly,
-        )
+            contract = Contract(
+                title=f"{title} – {client.name}",
+                client=client,
+                signature_date=fake.date_between(start_date="-30M", end_date="-24M"),
+                start_date=fake.date_between(start_date="-24M", end_date="-20M"),
+                rate=rate,
+                currency="EUR",
+                VAT_rate=Decimal("0.19"),
+                unit=TimeUnit.hour,
+                units_per_workday=8,
+                volume=random.randint(100, 400),
+                term_of_payment=14,
+                billing_cycle=Cycle.monthly,
+            )
         contracts.append(contract)
 
     _CANONICAL_PROJECTS = {
@@ -561,9 +577,12 @@ def create_heating_data(
 
     today = datetime.date.today()
     invoices = []
+    sam_lowry_project = None
     for i, project in enumerate(projects):
+        if project.contract is sam_lowry_contract:
+            sam_lowry_project = project
+            continue
         if i < 2:
-            # First two invoices: sent but unpaid, dated 30+ days ago → overdue
             inv_date = today - timedelta(days=random.randint(30, 60))
             inv = create_fake_invoice(
                 fake,
@@ -576,6 +595,61 @@ def create_heating_data(
         else:
             inv = create_fake_invoice(fake, project=project, user=user)
         invoices.append(inv)
+
+    # -- deposit / final invoice workflow for Sam Lowry -----------------------
+    milestones = []
+    deposit_invoices = []
+    if sam_lowry_contract and sam_lowry_project:
+        from tuttle.invoicing import generate_deposit_invoice, generate_final_invoice
+
+        ms1 = PaymentMilestone(
+            contract=sam_lowry_contract,
+            title="Half upfront",
+            percentage=Decimal("50"),
+            position=0,
+            invoiced=True,
+        )
+        ms2 = PaymentMilestone(
+            contract=sam_lowry_contract,
+            title="Half on delivery",
+            percentage=Decimal("50"),
+            position=1,
+            invoiced=True,
+        )
+        milestones = [ms1, ms2]
+
+        # Milestone 1 → deposit invoice (paid)
+        dep_date = today - timedelta(days=45)
+        dep_number = f"{dep_date.strftime('%Y-%m-%d')}-{next(invoice_number_counter)}"
+        dep = generate_deposit_invoice(
+            contract=sam_lowry_contract,
+            project=sam_lowry_project,
+            milestone=ms1,
+            number=dep_number,
+            date=dep_date,
+        )
+        dep.sent = True
+        dep.paid = True
+        deposit_invoices.append(dep)
+
+        # Milestone 2 (last) → final invoice that deducts the deposit
+        final_date = today - timedelta(days=7)
+        final_number = (
+            f"{final_date.strftime('%Y-%m-%d')}-{next(invoice_number_counter)}"
+        )
+        final_inv = generate_final_invoice(
+            contract=sam_lowry_contract,
+            project=sam_lowry_project,
+            deposit_invoices=deposit_invoices,
+            number=final_number,
+            date=final_date,
+        )
+        final_inv.sent = True
+        final_inv.paid = False
+        final_inv.milestone_id = ms2.id
+        invoices.extend(deposit_invoices)
+        invoices.append(final_inv)
+
     return projects, invoices, client_contacts
 
 
@@ -781,6 +855,7 @@ def install_demo_data(
                 )
             except Exception as ex:
                 logger.warning(f"Could not render demo invoice {inv.number}: {ex}")
+        session.commit()
 
     logger.info("Adding financial goals...")
     with Session(db_engine) as session:

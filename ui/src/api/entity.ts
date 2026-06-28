@@ -154,6 +154,14 @@ export function isReminder(e: Entity): boolean {
   return bool(e, "is_reminder") || str(e, "document_type") === "reminder";
 }
 
+export function isDeposit(e: Entity): boolean {
+  return bool(e, "is_deposit") || str(e, "document_type") === "deposit";
+}
+
+export function isFinalInvoice(e: Entity): boolean {
+  return bool(e, "is_final_invoice") || str(e, "document_type") === "final";
+}
+
 export function reminderLevel(e: Entity): number {
   return num(e, "reminder_level");
 }
@@ -162,4 +170,108 @@ export function reminderChainHeadId(e: Entity): number | null {
   const v = e.reminder_chain_head_id;
   if (v == null) return null;
   return typeof v === "number" ? v : null;
+}
+
+export function depositChainHeadId(e: Entity): number | null {
+  const v = e.deposit_chain_head_id;
+  if (v == null) return null;
+  return typeof v === "number" ? v : null;
+}
+
+/** Milestone title or first line-item description for a deposit invoice. */
+export function depositMilestoneLabel(e: Entity): string {
+  const title = deepStr(e, "milestone.title");
+  if (title) return title;
+  const items = list(e, "items");
+  if (items.length > 0) {
+    const desc = str(items[0], "description");
+    if (desc) return desc;
+  }
+  return "";
+}
+
+export type MilestoneScheduleStatus = {
+  total: number;
+  invoicedCount: number;
+  paidCount: number;
+  allInvoiced: boolean;
+  allDepositsPaid: boolean;
+  hasFinal: boolean;
+  /** All milestones invoiced and paid via deposits (legacy) or final invoice. */
+  completeWithoutFinal: boolean;
+  settled: boolean;
+};
+
+function lastMilestoneId(contract: Entity): number | null {
+  const milestones = list(contract, "payment_milestones");
+  if (milestones.length === 0) return null;
+  const sorted = [...milestones].sort(
+    (a, b) => num(a, "position") - num(b, "position") || num(a, "id") - num(b, "id"),
+  );
+  return num(sorted[sorted.length - 1], "id") || null;
+}
+
+/** Last milestone invoice — the final settlement (Schlussrechnung). */
+export function isSettlementDeposit(e: Entity): boolean {
+  if (!isDeposit(e)) return false;
+  const contract = entity(e, "contract");
+  if (!contract) return false;
+  const lastId = lastMilestoneId(contract);
+  return lastId != null && int(e, "milestone_id") === lastId;
+}
+
+export function displaysAsFinal(e: Entity): boolean {
+  return isFinalInvoice(e) || isSettlementDeposit(e);
+}
+
+export function chainDepositInvoices(root: Entity, nestedDeposits: Entity[]): Entity[] {
+  const deps = nestedDeposits.filter(isDeposit);
+  if (isDeposit(root)) return [root, ...deps];
+  return deps;
+}
+
+/** Progress of a contract's payment milestones for a grouped invoice chain. */
+export function milestoneScheduleStatus(
+  root: Entity,
+  nestedDeposits: Entity[],
+): MilestoneScheduleStatus | null {
+  const contract = entity(root, "contract");
+  if (!contract) return null;
+  const milestones = list(contract, "payment_milestones");
+  if (milestones.length === 0) return null;
+
+  const deposits = chainDepositInvoices(root, nestedDeposits);
+  const invoiceByMilestone = new Map<number, Entity>();
+  for (const d of deposits) {
+    const mid = int(d, "milestone_id");
+    if (mid) invoiceByMilestone.set(mid, d);
+  }
+  const rootMid = int(root, "milestone_id");
+  if (rootMid) invoiceByMilestone.set(rootMid, root);
+
+  let invoicedCount = 0;
+  let paidCount = 0;
+  for (const m of milestones) {
+    if (bool(m, "invoiced")) invoicedCount++;
+    const inv = invoiceByMilestone.get(m.id);
+    if (inv && invoiceStatus(inv) === "Paid") paidCount++;
+  }
+
+  const hasFinal = isFinalInvoice(root);
+  const allInvoiced = invoicedCount === milestones.length;
+  const allDepositsPaid = paidCount === milestones.length;
+  const completeWithoutFinal = allInvoiced && allDepositsPaid && !hasFinal;
+  const settled =
+    (hasFinal && invoiceStatus(root) === "Paid") || completeWithoutFinal;
+
+  return {
+    total: milestones.length,
+    invoicedCount,
+    paidCount,
+    allInvoiced,
+    allDepositsPaid,
+    hasFinal,
+    completeWithoutFinal,
+    settled,
+  };
 }

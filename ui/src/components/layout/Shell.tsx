@@ -21,7 +21,7 @@ import { NavigationContext, type NavigationFilter } from "../shared/NavigationCo
 import { rpc } from "../../api/rpc";
 import { useThemeProvider, ThemeContext } from "../../hooks/useTheme";
 
-type BootState = "loading" | "welcome" | "ready";
+type BootState = "loading" | "welcome" | "ready" | "error";
 
 type BootPhase =
   | "init"
@@ -51,6 +51,7 @@ export function Shell() {
   const [allUsers, setAllUsers] = useState<RegisteredUser[]>([]);
   const [regDialogOpen, setRegDialogOpen] = useState(false);
   const [regLoading, setRegLoading] = useState(false);
+  const [bootError, setBootError] = useState<string | null>(null);
 
   const navigate = useCallback((view: string, filter?: NavigationFilter) => {
     setNavFilter(filter || {});
@@ -75,8 +76,14 @@ export function Shell() {
 
   useEffect(() => {
     (async () => {
+      setBootError(null);
       setBootPhase("registry");
-      await rpc("db.ensure");
+      const ensureRes = await rpc("db.ensure");
+      if (!ensureRes.ok) {
+        setBootError(ensureRes.error || "Database migration failed. Your data may need repair.");
+        setBootState("error");
+        return;
+      }
       setBootPhase("users");
       const usersRes = await rpc<RegisteredUser[]>("users.list");
       const users = usersRes.ok && usersRes.data ? usersRes.data : [];
@@ -168,6 +175,27 @@ export function Shell() {
         <div className="text-center space-y-2">
           <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
           <p className="text-sm">{PHASE[bootPhase]}…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (bootState === "error") {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-bg-content text-secondary p-8">
+        <div className="max-w-md text-center space-y-4">
+          <h1 className="text-lg font-semibold text-primary">Could not open your database</h1>
+          <p className="text-sm">{bootError}</p>
+          <p className="text-xs text-tertiary">
+            This often happens after a failed schema migration during development.
+            Run <code className="text-primary">just reset-dev</code> to wipe dev data and start fresh,
+            or restore from a <code className="text-primary">.bak-*</code> backup in your data directory.
+          </p>
+          <button
+            onClick={() => { setBootState("loading"); window.location.reload(); }}
+            className="px-4 py-2 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
+            Retry
+          </button>
         </div>
       </div>
     );
